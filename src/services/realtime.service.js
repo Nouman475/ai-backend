@@ -138,15 +138,12 @@ function createRtpSender(sendSock, host, port) {
 function createDeepgramWS(onUtterance) {
   const params = new URLSearchParams({
     model: "nova-2",
-    language: "multi",
     encoding: "mulaw",
     sample_rate: "8000",
     channels: "1",
     interim_results: "true",
     endpointing: "400",
     utterance_end_ms: "1200",
-    smart_format: "true",
-    punctuate: "true",
   });
 
   const ws = new WebSocket(`wss://api.deepgram.com/v1/listen?${params}`, {
