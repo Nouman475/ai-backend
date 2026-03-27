@@ -189,15 +189,14 @@ function createRtpSender(sendSock, host, port) {
 // ✅ Multi-language support: Urdu, Arabic, English
 function createDeepgramWS(onUtterance) {
   const params = new URLSearchParams({
-    model:            "nova-2",        // nova-2 is better for multi-language
-    language:         "multi",         // Auto-detect: Urdu, Arabic, English
+    model:            "nova-2",
+    language:         "multi",
     encoding:         "mulaw",
     sample_rate:      "8000",
     channels:         "1",
     endpointing:      "500",
     interim_results:  "true",
     utterance_end_ms: "1500",
-    detect_language:  "true",          // Enable language detection
   });
 
   const url = `wss://api.deepgram.com/v1/listen?${params}`;
@@ -209,7 +208,7 @@ function createDeepgramWS(onUtterance) {
 
   ws.on("open",  () => console.log("🟢 Deepgram connected (Multi-language: Urdu/Arabic/English)"));
   ws.on("error", (e) => console.error("❌ Deepgram error:", e.message));
-  ws.on("close", (c, reason) => console.log(`🔴 Deepgram closed (${c}) ${reason}`));
+  ws.on("close", (c, reason) => console.log(`🔴 Deepgram closed (${c}) ${reason || 'connection closed'}`));
 
   let accumulated = "";
   let detectedLanguage = "en";
@@ -218,12 +217,6 @@ function createDeepgramWS(onUtterance) {
     try {
       const data = JSON.parse(raw.toString());
 
-      // Detect language from metadata
-      if (data.channel?.detected_language) {
-        detectedLanguage = data.channel.detected_language;
-      }
-
-      // ── UtteranceEnd: silence timeout — flush whatever was accumulated
       if (data.type === "UtteranceEnd") {
         if (accumulated.trim()) {
           console.log(`\n📝 [UtteranceEnd] [${detectedLanguage}] → "${accumulated}"`);
@@ -237,30 +230,60 @@ function createDeepgramWS(onUtterance) {
       const txt = alt?.transcript?.trim();
       if (!txt) return;
 
+      // Simple language detection from script
+      if (/[\u0600-\u06FF]/.test(txt)) {
+        if (/[\u0621-\u063A\u0641-\u064A]/.test(txt)) {
+          detectedLanguage = "ar";
+        } else {
+          detectedLanguage = "ur";
+        }
+      } else if (/^[a-zA-Z\s]+$/.test(txt)) {
+        detectedLanguage = "en";
+      }
+
       if (data.is_final) {
-        // Accumulate final segments into one utterance
         accumulated += (accumulated ? " " : "") + txt;
         process.stdout.write(`\r📝 [FINAL] [${detectedLanguage}] "${accumulated}"\n`);
 
         if (data.speech_final) {
-          // Natural end of speech — respond immediately
           onUtterance(accumulated.trim(), detectedLanguage);
           accumulated = "";
         }
       } else {
         process.stdout.write(`\r📝 [live]  ${txt}          `);
       }
-    } catch (_) {}
+    } catch (err) {
+      console.error("⚠️ Deepgram message error:", err.message);
+    }
   });
 
   return new Promise((resolve, reject) => {
-    ws.once("open", () =>
+    const timeout = setTimeout(() => {
+      reject(new Error("Deepgram connection timeout"));
+    }, 10000);
+
+    ws.once("open", () => {
+      clearTimeout(timeout);
       resolve({
-        send:  (buf) => { if (ws.readyState === WebSocket.OPEN) ws.send(buf); },
-        close: ()    => { try { ws.close(); } catch (_) {} },
-      }),
-    );
-    ws.once("error", reject);
+        send: (buf) => { 
+          if (ws.readyState === WebSocket.OPEN) {
+            try { ws.send(buf); } catch (e) { console.error("⚠️ Send error:", e.message); }
+          }
+        },
+        close: () => { 
+          try { 
+            if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+              ws.close();
+            }
+          } catch (e) { console.error("⚠️ Close error:", e.message); }
+        },
+      });
+    });
+
+    ws.once("error", (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
   });
 }
 
