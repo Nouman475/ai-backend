@@ -186,17 +186,18 @@ function createRtpSender(sendSock, host, port) {
 //   });
 // }
 
-// ✅ nova-3 + language=ur + UtteranceEnd dual-trigger (fixes "transcribes but never responds")
+// ✅ Multi-language support: Urdu, Arabic, English
 function createDeepgramWS(onUtterance) {
   const params = new URLSearchParams({
-    model:            "nova-3",
-    language:         "ur",       // explicit Urdu — prevents Hindi confusion
+    model:            "nova-2",        // nova-2 is better for multi-language
+    language:         "multi",         // Auto-detect: Urdu, Arabic, English
     encoding:         "mulaw",
     sample_rate:      "8000",
     channels:         "1",
     endpointing:      "500",
     interim_results:  "true",
-    utterance_end_ms: "1500",     // silence timeout fallback trigger
+    utterance_end_ms: "1500",
+    detect_language:  "true",          // Enable language detection
   });
 
   const url = `wss://api.deepgram.com/v1/listen?${params}`;
@@ -206,21 +207,27 @@ function createDeepgramWS(onUtterance) {
     headers: { Authorization: `Token ${DEEPGRAM_KEY}` },
   });
 
-  ws.on("open",  () => console.log("🟢 Deepgram connected (Urdu / nova-3)"));
+  ws.on("open",  () => console.log("🟢 Deepgram connected (Multi-language: Urdu/Arabic/English)"));
   ws.on("error", (e) => console.error("❌ Deepgram error:", e.message));
   ws.on("close", (c, reason) => console.log(`🔴 Deepgram closed (${c}) ${reason}`));
 
   let accumulated = "";
+  let detectedLanguage = "en";
 
   ws.on("message", (raw) => {
     try {
       const data = JSON.parse(raw.toString());
 
+      // Detect language from metadata
+      if (data.channel?.detected_language) {
+        detectedLanguage = data.channel.detected_language;
+      }
+
       // ── UtteranceEnd: silence timeout — flush whatever was accumulated
       if (data.type === "UtteranceEnd") {
         if (accumulated.trim()) {
-          console.log(`\n📝 [UtteranceEnd] → "${accumulated}"`);
-          onUtterance(accumulated.trim(), "ur");
+          console.log(`\n📝 [UtteranceEnd] [${detectedLanguage}] → "${accumulated}"`);
+          onUtterance(accumulated.trim(), detectedLanguage);
           accumulated = "";
         }
         return;
@@ -233,11 +240,11 @@ function createDeepgramWS(onUtterance) {
       if (data.is_final) {
         // Accumulate final segments into one utterance
         accumulated += (accumulated ? " " : "") + txt;
-        process.stdout.write(`\r📝 [FINAL] "${accumulated}"\n`);
+        process.stdout.write(`\r📝 [FINAL] [${detectedLanguage}] "${accumulated}"\n`);
 
         if (data.speech_final) {
           // Natural end of speech — respond immediately
-          onUtterance(accumulated.trim(), "ur");
+          onUtterance(accumulated.trim(), detectedLanguage);
           accumulated = "";
         }
       } else {
@@ -388,7 +395,9 @@ async function respondToUser(
         ? "Urdu"
         : detectedLang === "ar"
           ? "Arabic"
-          : "English";
+          : detectedLang === "en"
+            ? "English"
+            : "the user's language";
 
     // Use agent's custom systemPrompt if provided, otherwise fall back to default
     const basePrompt = agentConfig?.systemPrompt?.trim()
@@ -400,11 +409,12 @@ Keep answers SHORT — 1 to 2 sentences. Be natural and conversational.`;
     const systemContent = `${basePrompt}
 
 IMPORTANT: Always reply in the SAME language the user is speaking.
-- If user speaks Urdu → reply in Urdu (Urdu script)
-- If user speaks Arabic → reply in Arabic
+- If user speaks Urdu → reply in Urdu (اردو میں جواب دیں)
+- If user speaks Arabic → reply in Arabic (أجب بالعربية)
 - If user speaks English → reply in English
-- If user mixes Urdu+English → reply in same mix
-- Sound like a polite call center agent. No lists or long explanations.`;
+- If user mixes languages → reply in same mix
+- Sound like a polite call center agent. No lists or long explanations.
+- Keep responses under 2 sentences for voice clarity.`;
 
     const model = agentConfig?.modelName || "gpt-4o-mini";
 
@@ -486,6 +496,8 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig) {
   let botSpeaking = false;
   let interrupted = false;
   let processing = false;
+  let dgConnection = null;
+  let rtpSock = null;
 
   function interrupt() {
     if (botSpeaking && currentSender) {
@@ -497,100 +509,139 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig) {
     }
   }
 
-  const rtpSock = dgram.createSocket("udp4");
-  let actualRemote = { ...remote };
-  let firstPacket = true;
-  let highEnergyCount = 0;
+  try {
+    rtpSock = dgram.createSocket("udp4");
+    let actualRemote = { ...remote };
+    let firstPacket = true;
+    let highEnergyCount = 0;
 
-  const INTERRUPT_THRESHOLD = 50;
-  const INTERRUPT_PACKETS = 5;
+    const INTERRUPT_THRESHOLD = 50;
+    const INTERRUPT_PACKETS = 5;
 
-  const dg = await createDeepgramWS(async (transcript, detectedLang) => {
-    if (!transcript) return;
+    dgConnection = await createDeepgramWS(async (transcript, detectedLang) => {
+      if (!transcript) return;
 
-    // Check bot-enabled flag from activeCalls map (can be toggled via API)
-    const callEntry = activeCalls.get(callMeta.callId);
-    const isBotEnabled = () => callEntry?.botEnabled ?? true;
+      // Check bot-enabled flag from activeCalls map (can be toggled via API)
+      const callEntry = activeCalls.get(callMeta.callId);
+      const isBotEnabled = () => callEntry?.botEnabled ?? true;
 
-    if (botSpeaking) interrupt();
-    if (processing) return;
+      if (botSpeaking) interrupt();
+      if (processing) return;
 
-    processing = true;
-    interrupted = false;
+      processing = true;
+      interrupted = false;
 
-    await respondToUser(
-      transcript,
-      detectedLang,
-      history,
-      rtpSock,
-      actualRemote,
-      (s) => {
-        currentSender = s;
-        botSpeaking = true;
-        // Expose sender to API for stop-bot
-        if (callEntry) callEntry.currentSender = s;
-      },
-      () => {
-        botSpeaking = false;
+      try {
+        await respondToUser(
+          transcript,
+          detectedLang,
+          history,
+          rtpSock,
+          actualRemote,
+          (s) => {
+            currentSender = s;
+            botSpeaking = true;
+            // Expose sender to API for stop-bot
+            if (callEntry) callEntry.currentSender = s;
+          },
+          () => {
+            botSpeaking = false;
+            processing = false;
+            if (callEntry) callEntry.currentSender = null;
+          },
+          () => interrupted,
+          isBotEnabled,
+          agentConfig,
+        );
+      } catch (err) {
+        console.error("❌ Error in respondToUser:", err.message);
+      } finally {
         processing = false;
-        if (callEntry) callEntry.currentSender = null;
-      },
-      () => interrupted,
-      isBotEnabled,
-      agentConfig,
-    );
+      }
+    });
 
-    processing = false;
-  });
+    rtpSock.on("message", (msg, rinfo) => {
+      if (msg.length <= 12) return;
 
-  rtpSock.on("message", (msg, rinfo) => {
-    if (msg.length <= 12) return;
+      if (firstPacket) {
+        actualRemote = { ip: rinfo.address, port: rinfo.port };
+        console.log(
+          `🎯 First RTP from ${rinfo.address}:${rinfo.port} (SDP said ${remote.ip}:${remote.port})`,
+        );
+        firstPacket = false;
+      }
 
-    if (firstPacket) {
-      actualRemote = { ip: rinfo.address, port: rinfo.port };
-      console.log(
-        `🎯 First RTP from ${rinfo.address}:${rinfo.port} (SDP said ${remote.ip}:${remote.port})`,
-      );
-      firstPacket = false;
-    }
+      const payload = msg.slice(12);
 
-    const payload = msg.slice(12);
+      if (botSpeaking) {
+        const energy =
+          payload.reduce((s, b) => s + ((b & 0x7f) ^ 0x7f), 0) / payload.length;
 
-    if (botSpeaking) {
-      const energy =
-        payload.reduce((s, b) => s + ((b & 0x7f) ^ 0x7f), 0) / payload.length;
-
-      if (energy > INTERRUPT_THRESHOLD) {
-        highEnergyCount++;
-        if (highEnergyCount >= INTERRUPT_PACKETS) {
+        if (energy > INTERRUPT_THRESHOLD) {
+          highEnergyCount++;
+          if (highEnergyCount >= INTERRUPT_PACKETS) {
+            highEnergyCount = 0;
+            interrupt();
+          }
+        } else {
           highEnergyCount = 0;
-          interrupt();
         }
       } else {
         highEnergyCount = 0;
       }
-    } else {
-      highEnergyCount = 0;
+
+      if (dgConnection) {
+        try {
+          dgConnection.send(payload);
+        } catch (err) {
+          console.error("⚠️ Deepgram send error:", err.message);
+        }
+      }
+    });
+
+    rtpSock.on("error", (e) => console.error("❌ RTP error:", e.message));
+
+    await new Promise((resolve, reject) => {
+      rtpSock.bind(localRtpPort, "0.0.0.0", (err) => {
+        if (err) {
+          console.error("❌ Failed to bind RTP socket:", err.message);
+          reject(err);
+        } else {
+          console.log(`🎧 RTP socket bound on 0.0.0.0:${localRtpPort}`);
+          resolve();
+        }
+      });
+    });
+
+    return {
+      stop: () => {
+        if (dgConnection) {
+          try { dgConnection.close(); } catch (_) {}
+        }
+        if (rtpSock) {
+          try { rtpSock.close(); } catch (_) {}
+        }
+        if (currentSender) {
+          try { currentSender.stop(); } catch (_) {}
+        }
+      },
+    };
+  } catch (err) {
+    console.error("❌ handleCall error:", err.message);
+    
+    // Cleanup on error
+    if (dgConnection) {
+      try { dgConnection.close(); } catch (_) {}
     }
-
-    dg.send(payload);
-  });
-
-  rtpSock.on("error", (e) => console.error("❌ RTP error:", e.message));
-
-  rtpSock.bind(localRtpPort, "0.0.0.0", () => {
-    console.log(`🎧 RTP socket bound on 0.0.0.0:${localRtpPort}`);
-  });
-
-  return {
-    stop: () => {
-      dg.close();
-      try {
-        rtpSock.close();
-      } catch (_) {}
-      if (currentSender) currentSender.stop();
-    },
-  };
+    if (rtpSock) {
+      try { rtpSock.close(); } catch (_) {}
+    }
+    if (currentSender) {
+      try { currentSender.stop(); } catch (_) {}
+    }
+    
+    throw err;
+  }
 }
 
 // ── SIP ───────────────────────────────────────────────────────────────────────
@@ -636,46 +687,67 @@ srf.invite(async (req, res) => {
 
   console.log(`\n📞 Call: ${fromNum} → ${toNum}  [${callId}]`);
   console.log(`📡 Remote RTP from SDP: ${remote.ip}:${remote.port}`);
-  res.send(100);
+  
+  try {
+    res.send(100);
+  } catch (e) {
+    console.error("❌ Failed to send 100 Trying:", e.message);
+    return;
+  }
+
+  let session = null;
+  let port = null;
 
   try {
-    const port = getFreePort();
+    port = getFreePort();
     const callMeta = {
       callId,
       fromNumber: fromNum,
       toNumber: toNum,
-      extension: "208",
+      extension: toNum,
     };
 
-    // Look up the extension's assigned AI agent
-    const extDoc = await SipExtension.findOne({ extension: toNum }).populate("aiAgent");
-    const agentConfig = extDoc?.aiAgent?.isActive
-      ? { systemPrompt: extDoc.aiAgent.systemPrompt, modelName: extDoc.aiAgent.modelName }
-      : null;
-
-    if (agentConfig) {
-      console.log(`🤖 Using agent: ${extDoc.aiAgent.name} (${agentConfig.modelName})`);
+    // Look up the extension's assigned AI agent (with error handling)
+    let agentConfig = null;
+    try {
+      const extDoc = await SipExtension.findOne({ extension: toNum }).populate("aiAgent");
+      if (extDoc?.aiAgent?.isActive) {
+        agentConfig = { 
+          systemPrompt: extDoc.aiAgent.systemPrompt, 
+          modelName: extDoc.aiAgent.modelName 
+        };
+        console.log(`🤖 Using agent: ${extDoc.aiAgent.name} (${agentConfig.modelName})`);
+      } else {
+        console.log(`🤖 No active agent for extension ${toNum}, using default`);
+      }
+    } catch (agentErr) {
+      console.error("⚠️ Failed to load AI agent, using default:", agentErr.message);
+      agentConfig = null;
     }
 
-    const session = await handleCall(port, remote, callMeta, agentConfig);
+    session = await handleCall(port, remote, callMeta, agentConfig);
 
     // ── Log to DB + in-memory ──────────────────────────────────────────────
-    await CallLog.create({
-      callId,
-      extension: "208",
-      fromNumber: fromNum,
-      toNumber: toNum,
-      remoteIp: remote.ip,
-      remotePort: remote.port,
-      status: "active",
-      botEnabled: true,
-    });
+    try {
+      await CallLog.create({
+        callId,
+        extension: toNum,
+        fromNumber: fromNum,
+        toNumber: toNum,
+        remoteIp: remote.ip,
+        remotePort: remote.port,
+        status: "active",
+        botEnabled: true,
+      });
+    } catch (dbErr) {
+      console.error("⚠️ Failed to log call to DB:", dbErr.message);
+    }
 
     activeCalls.set(callId, {
       session,
       fromNumber: fromNum,
       toNumber: toNum,
-      extension: "208",
+      extension: toNum,
       startedAt: new Date(),
       botEnabled: true,
       currentSender: null,
@@ -689,34 +761,47 @@ srf.invite(async (req, res) => {
 
     dialog.on("destroy", async () => {
       console.log("📵 Call ended");
-      session.stop();
-      usedPorts.delete(port);
+      if (session) session.stop();
+      if (port) usedPorts.delete(port);
 
       // ── Update DB + remove from active map ─────────────────────────────
       const startedAt = activeCalls.get(callId)?.startedAt;
       activeCalls.delete(callId);
 
-      await CallLog.findOneAndUpdate(
-        { callId },
-        {
-          status: "ended",
-          endedAt: new Date(),
-          durationSeconds: startedAt
-            ? Math.floor((Date.now() - startedAt.getTime()) / 1000)
-            : null,
-        },
-      );
+      try {
+        await CallLog.findOneAndUpdate(
+          { callId },
+          {
+            status: "ended",
+            endedAt: new Date(),
+            durationSeconds: startedAt
+              ? Math.floor((Date.now() - startedAt.getTime()) / 1000)
+              : null,
+          },
+        );
+      } catch (dbErr) {
+        console.error("⚠️ Failed to update call log:", dbErr.message);
+      }
     });
   } catch (e) {
-    console.error("❌ Call error:", e.message, e.stack);
+    console.error("❌ Call error:", e.message);
+    console.error("Stack:", e.stack);
 
-    await CallLog.findOneAndUpdate({ callId }, { status: "failed" }).catch(
-      () => {},
-    );
+    // Cleanup
+    if (session) {
+      try { session.stop(); } catch (_) {}
+    }
+    if (port) usedPorts.delete(port);
     activeCalls.delete(callId);
 
+    // Update DB
     try {
-      res.send(500);
+      await CallLog.findOneAndUpdate({ callId }, { status: "failed" });
+    } catch (_) {}
+
+    // Send error response
+    try {
+      res.send(500, "Internal Server Error");
     } catch (_) {}
   }
 });

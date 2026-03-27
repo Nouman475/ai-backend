@@ -96,7 +96,6 @@ const registerSipExtension = asyncHandler(async (req, res) => {
     if (!ext) throw new ApiError(404, "Extension not found");
 
     // Dynamically import srf from the running realtime module
-    // The realtime.js module must export `srf` for this to work
     let srf;
     try {
         const rtModule = await import("../services/realtime.service.js");
@@ -109,8 +108,18 @@ const registerSipExtension = asyncHandler(async (req, res) => {
         throw new ApiError(503, "SIP server module not available. Make sure drachtio server is running.");
     }
 
+    // Check if already registered and cleanup old registration
+    if (activeSrfSessions.has(extension)) {
+        console.log(`⚠️ Extension ${extension} already has active session, cleaning up...`);
+        const oldSession = activeSrfSessions.get(extension);
+        try {
+            if (oldSession.req) oldSession.req.cancel();
+        } catch (_) {}
+        activeSrfSessions.delete(extension);
+    }
+
     await new Promise((resolve, reject) => {
-        srf.request(`sip:${ext.domain}`, {
+        const registerReq = srf.request(`sip:${ext.domain}`, {
             method: "REGISTER",
             headers: {
                 Contact: `<sip:${ext.extension}@${process.env.PUBLIC_IP}:5070>`,
@@ -119,16 +128,31 @@ const registerSipExtension = asyncHandler(async (req, res) => {
             },
             auth: { username: ext.extension, password: ext.password },
         }, (err, request) => {
-            if (err) return reject(new ApiError(502, `REGISTER failed: ${err.message}`));
+            if (err) {
+                console.error(`❌ REGISTER failed for ${extension}:`, err.message);
+                return reject(new ApiError(502, `REGISTER failed: ${err.message}`));
+            }
+            
             request.on("response", async (sipRes) => {
                 if (sipRes.status === 200) {
                     ext.isRegistered = true;
                     ext.registeredAt = new Date();
                     await ext.save();
+                    
+                    // Store session for cleanup
+                    activeSrfSessions.set(extension, { srf, req: request, res: sipRes });
+                    
+                    console.log(`✅ Extension ${extension} registered successfully`);
                     resolve();
                 } else {
+                    console.error(`❌ SIP responded ${sipRes.status} ${sipRes.reason}`);
                     reject(new ApiError(502, `SIP responded ${sipRes.status} ${sipRes.reason}`));
                 }
+            });
+            
+            request.on("error", (err) => {
+                console.error(`❌ REGISTER request error for ${extension}:`, err.message);
+                reject(new ApiError(502, `REGISTER request error: ${err.message}`));
             });
         });
     });
@@ -166,6 +190,16 @@ const unregisterSipExtension = asyncHandler(async (req, res) => {
         throw new ApiError(503, "SIP server module not available. Make sure drachtio server is running.");
     }
 
+    // Cleanup old session first
+    if (activeSrfSessions.has(extension)) {
+        console.log(`🧹 Cleaning up old session for ${extension}`);
+        const oldSession = activeSrfSessions.get(extension);
+        try {
+            if (oldSession.req) oldSession.req.cancel();
+        } catch (_) {}
+        activeSrfSessions.delete(extension);
+    }
+
     await new Promise((resolve, reject) => {
         srf.request(`sip:${ext.domain}`, {
             method: "REGISTER",
@@ -177,11 +211,23 @@ const unregisterSipExtension = asyncHandler(async (req, res) => {
             },
             auth: { username: ext.extension, password: ext.password },
         }, (err, request) => {
-            if (err) return reject(new ApiError(502, `UNREGISTER failed: ${err.message}`));
+            if (err) {
+                console.error(`❌ UNREGISTER failed for ${extension}:`, err.message);
+                return reject(new ApiError(502, `UNREGISTER failed: ${err.message}`));
+            }
             request.on("response", async (sipRes) => {
                 ext.isRegistered = false;
+                ext.registeredAt = null;
                 await ext.save();
+                console.log(`✅ Extension ${extension} unregistered successfully`);
                 resolve();
+            });
+            request.on("error", (err) => {
+                console.error(`❌ UNREGISTER request error for ${extension}:`, err.message);
+                // Still mark as unregistered even if error
+                ext.isRegistered = false;
+                ext.registeredAt = null;
+                ext.save().then(() => resolve()).catch(() => resolve());
             });
         });
     });
