@@ -12,10 +12,10 @@ export const activeSrfSessions = new Map();
 // GET /api/v1/sip/
 // Returns all SIP extensions belonging to the logged-in user
 // ─────────────────────────────────────────────────────────────────────────────
-const getAllSipExtensions = asyncHandler(async (req, res) => {
-    const extensions = await SipExtension.find({ createdBy: req.user._id }).select(
-        "-password"
-    );
+  const getAllSipExtensions = asyncHandler(async (req, res) => {
+    const extensions = await SipExtension.find({ createdBy: req.user._id })
+        .populate('aiAgent', 'name purpose modelProvider modelName')
+        .select("-password");
 
     return res
         .status(200)
