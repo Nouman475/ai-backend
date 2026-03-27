@@ -13,7 +13,6 @@ import { v4 as uuidv4 } from "uuid";
 import { activeCalls } from "../controllers/call.controller.js";
 import { CallLog } from "../models/calllog.model.js";
 import { SipExtension } from "../models/extension.model.js";
-import { AIAgent } from "../models/aiagent.model.js";
 
 export const srf = new Srf();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -136,256 +135,79 @@ function createRtpSender(sendSock, host, port) {
 }
 
 // ── Deepgram WebSocket ────────────────────────────────────────────────────────
-// function createDeepgramWS(onUtterance) {
-//   const params = new URLSearchParams({
-//     model: "nova-2",
-//     language: "multi",
-//     encoding: "mulaw",
-//     sample_rate: "8000",
-//     channels: "1",
-//     endpointing: "400",
-//     interim_results: "true",
-//     utterance_end_ms: "1200",
-//   });
-
-//   const ws = new WebSocket(`wss://api.deepgram.com/v1/listen?${params}`, {
-//     headers: { Authorization: `Token ${DEEPGRAM_KEY}` },
-//   });
-
-//   ws.on("open", () => console.log("🟢 Deepgram WS connected"));
-//   ws.on("error", (e) => console.error("❌ Deepgram error:", e.message));
-//   ws.on("close", (c) => console.log(`🔴 Deepgram closed (${c})`));
-
-//   ws.on("message", (raw) => {
-//     try {
-//       const data = JSON.parse(raw.toString());
-//       const txt = data.channel?.alternatives?.[0]?.transcript?.trim();
-//       if (!txt) return;
-
-//       if (data.is_final) {
-//         process.stdout.write(`\r📝 [FINAL] ${txt}\n`);
-//         if (data.speech_final) onUtterance(txt);
-//       } else {
-//         process.stdout.write(`\r📝 [live]  ${txt}          `);
-//       }
-//     } catch (_) {}
-//   });
-
-//   return new Promise((resolve, reject) => {
-//     ws.once("open", () =>
-//       resolve({
-//         send: (buf) => {
-//           if (ws.readyState === WebSocket.OPEN) ws.send(buf);
-//         },
-//         close: () => {
-//           try { ws.close(); } catch (_) {}
-//         },
-//       })
-//     );
-//     ws.once("error", reject);
-//   });
-// }
-
-// ✅ Multi-language support: Urdu, Arabic, English
 function createDeepgramWS(onUtterance) {
   const params = new URLSearchParams({
-    model:            "nova-2",
-    language:         "multi",
-    encoding:         "mulaw",
-    sample_rate:      "8000",
-    channels:         "1",
-    endpointing:      "500",
-    interim_results:  "true",
-    utterance_end_ms: "1500",
+    model: "nova-3",
+    encoding: "mulaw",
+    sample_rate: "8000",
+    channels: "1",
+    detect_language: "true",
+    interim_results: "true",
+    endpointing: "400",
+    utterance_end_ms: "1200",
+    smart_format: "true",
+    punctuate: "true",
   });
 
-  const url = `wss://api.deepgram.com/v1/listen?${params}`;
-  console.log("🔗 Deepgram URL:", url);
-
-  const ws = new WebSocket(url, {
+  const ws = new WebSocket(`wss://api.deepgram.com/v1/listen?${params}`, {
     headers: { Authorization: `Token ${DEEPGRAM_KEY}` },
   });
 
-  ws.on("open",  () => console.log("🟢 Deepgram connected (Multi-language: Urdu/Arabic/English)"));
+  ws.on("open", () => console.log("🟢 Deepgram WS connected"));
   ws.on("error", (e) => console.error("❌ Deepgram error:", e.message));
-  ws.on("close", (c, reason) => console.log(`🔴 Deepgram closed (${c}) ${reason || 'connection closed'}`));
-
-  let accumulated = "";
-  let detectedLanguage = "en";
+  ws.on("close", (c) => console.log(`🔴 Deepgram closed (${c})`));
 
   ws.on("message", (raw) => {
     try {
       const data = JSON.parse(raw.toString());
 
-      if (data.type === "UtteranceEnd") {
-        if (accumulated.trim()) {
-          console.log(`\n📝 [UtteranceEnd] [${detectedLanguage}] → "${accumulated}"`);
-          onUtterance(accumulated.trim(), detectedLanguage);
-          accumulated = "";
-        }
-        return;
-      }
+      if (data.is_final)
+        console.log(
+          "🔍 Deepgram raw:",
+          JSON.stringify(data.channel?.alternatives?.[0]).slice(0, 200),
+        );
+      const txt = data.channel?.alternatives?.[0]?.transcript?.trim();
 
-      const alt = data.channel?.alternatives?.[0];
-      const txt = alt?.transcript?.trim();
+      const detectedLang =
+        data.channel?.detected_language ||
+        data.channel?.alternatives?.[0]?.languages?.[0]?.language ||
+        "en";
+
+      console.log("🌍 detectedLang:", detectedLang, typeof detectedLang);
+
       if (!txt) return;
-
-      // Simple language detection from script
-      if (/[\u0600-\u06FF]/.test(txt)) {
-        if (/[\u0621-\u063A\u0641-\u064A]/.test(txt)) {
-          detectedLanguage = "ar";
-        } else {
-          detectedLanguage = "ur";
-        }
-      } else if (/^[a-zA-Z\s]+$/.test(txt)) {
-        detectedLanguage = "en";
-      }
+      if (txt.length < 2) return;
 
       if (data.is_final) {
-        accumulated += (accumulated ? " " : "") + txt;
-        process.stdout.write(`\r📝 [FINAL] [${detectedLanguage}] "${accumulated}"\n`);
+        process.stdout.write(`\r📝 [FINAL ${detectedLang || ""}] ${txt}\n`);
 
-        if (data.speech_final) {
-          onUtterance(accumulated.trim(), detectedLanguage);
-          accumulated = "";
-        }
+        if (data.speech_final) onUtterance(txt, detectedLang);
       } else {
-        process.stdout.write(`\r📝 [live]  ${txt}          `);
+        process.stdout.write(
+          `\r📝 [live ${detectedLang || ""}] ${txt}          `,
+        );
       }
-    } catch (err) {
-      console.error("⚠️ Deepgram message error:", err.message);
-    }
+    } catch (_) {}
   });
 
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      reject(new Error("Deepgram connection timeout"));
-    }, 10000);
-
-    ws.once("open", () => {
-      clearTimeout(timeout);
+    ws.once("open", () =>
       resolve({
-        send: (buf) => { 
-          if (ws.readyState === WebSocket.OPEN) {
-            try { ws.send(buf); } catch (e) { console.error("⚠️ Send error:", e.message); }
-          }
+        send: (buf) => {
+          if (ws.readyState === WebSocket.OPEN) ws.send(buf);
         },
-        close: () => { 
-          try { 
-            if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-              ws.close();
-            }
-          } catch (e) { console.error("⚠️ Close error:", e.message); }
+        close: () => {
+          try {
+            ws.close();
+          } catch (_) {}
         },
-      });
-    });
-
-    ws.once("error", (err) => {
-      clearTimeout(timeout);
-      reject(err);
-    });
+      }),
+    );
+    ws.once("error", reject);
   });
 }
 
 // ── GPT + TTS ─────────────────────────────────────────────────────────────────
-// async function respondToUser(
-//   transcript,
-//   history,
-//   rtpSock,
-//   remote,
-//   onStart,
-//   onDone,
-//   isInterrupted,
-//   isBotEnabled,
-// ) {
-//   // Respect bot-enabled flag set via API
-//   if (!isBotEnabled()) {
-//     console.log("🤖 Bot disabled for this call — skipping response");
-//     return;
-//   }
-
-//   console.log(`\n💬 User: ${transcript}`);
-//   history.push({ role: "user", content: transcript });
-
-//   const sender = createRtpSender(rtpSock, remote.ip, remote.port);
-//   onStart(sender);
-
-//   console.log(`📤 Will send audio → ${remote.ip}:${remote.port}`);
-
-//   try {
-//     const stream = await openai.chat.completions.create({
-//       model: "gpt-4o-mini",
-//       stream: true,
-//       max_tokens: 120,
-//       messages: [
-//         {
-//           role: "system",
-//           content:
-//             "You are a helpful voice assistant on a phone call. Keep answers SHORT — 1 to 2 sentences. Be natural and conversational.",
-//         },
-//         ...history,
-//       ],
-//     });
-
-//     let fullReply = "";
-//     let pending = "";
-
-//     async function flushTTS(text) {
-//       text = text.trim();
-//       if (!text || isInterrupted() || !isBotEnabled()) return;
-//       console.log(`🗣️  TTS: "${text}"`);
-//       try {
-//         const res = await openai.audio.speech.create({
-//           model: "tts-1",
-//           voice: "alloy",
-//           input: text,
-//           response_format: "pcm",
-//           speed: 1.0,
-//         });
-//         if (isInterrupted() || !isBotEnabled()) return;
-//         const pcm = Buffer.from(await res.arrayBuffer());
-//         const mulaw = pcm24kToMulaw8k(pcm);
-//         console.log(
-//           `🔊 Streaming ${mulaw.length} bytes (${Math.ceil(mulaw.length / 160)} packets) → ${remote.ip}:${remote.port}`
-//         );
-//         if (!isInterrupted() && isBotEnabled()) await sender.streamBuffer(mulaw);
-//       } catch (e) {
-//         console.error("❌ TTS error:", e.message);
-//       }
-//     }
-
-//     for await (const chunk of stream) {
-//       if (isInterrupted() || !isBotEnabled()) break;
-//       const token = chunk.choices[0]?.delta?.content || "";
-//       fullReply += token;
-//       pending += token;
-
-//       if (/[.!?।]\s/.test(pending)) {
-//         const parts = pending.split(/(?<=[.!?।])\s+/);
-//         for (let i = 0; i < parts.length - 1; i++) {
-//           await flushTTS(parts[i]);
-//           if (isInterrupted() || !isBotEnabled()) break;
-//         }
-//         pending = parts[parts.length - 1] || "";
-//       }
-//     }
-
-//     if (!isInterrupted() && isBotEnabled() && pending.trim()) await flushTTS(pending);
-
-//     if (!isInterrupted()) {
-//       history.push({ role: "assistant", content: fullReply });
-//       console.log(`\n🤖 Bot: ${fullReply}`);
-//     }
-//   } catch (e) {
-//     console.error("❌ GPT error:", e.message);
-//   }
-
-//   sender.stop();
-//   onDone();
-//   console.log("\n🎙️  Listening...");
-// }
-
-// Updated Version
 async function respondToUser(
   transcript,
   detectedLang,
@@ -396,9 +218,8 @@ async function respondToUser(
   onDone,
   isInterrupted,
   isBotEnabled,
-  agentConfig,   // { systemPrompt, modelName } from AIAgent doc (optional)
+  agentConfig,
 ) {
-  // Respect bot-enabled flag set via API
   if (!isBotEnabled()) {
     console.log("🤖 Bot disabled for this call — skipping response");
     return;
@@ -418,26 +239,22 @@ async function respondToUser(
         ? "Urdu"
         : detectedLang === "ar"
           ? "Arabic"
-          : detectedLang === "en"
-            ? "English"
-            : "the user's language";
+          : "English";
 
-    // Use agent's custom systemPrompt if provided, otherwise fall back to default
     const basePrompt = agentConfig?.systemPrompt?.trim()
       ? agentConfig.systemPrompt
-      : `You are a helpful voice assistant on a phone call.
-Keep answers SHORT — 1 to 2 sentences. Be natural and conversational.`;
+      : `You are a helpful AI voice assistant on a phone call.
 
-    // Append multilanguage instruction (always enforced)
-    const systemContent = `${basePrompt}
+The caller is speaking ${langLabel}.
+You MUST respond in ${langLabel} only. Do not switch languages.
 
-IMPORTANT: Always reply in the SAME language the user is speaking.
-- If user speaks Urdu → reply in Urdu (اردو میں جواب دیں)
-- If user speaks Arabic → reply in Arabic (أجب بالعربية)
-- If user speaks English → reply in English
-- If user mixes languages → reply in same mix
-- Sound like a polite call center agent. No lists or long explanations.
-- Keep responses under 2 sentences for voice clarity.`;
+Rules:
+- Keep responses short (1–2 sentences)
+- Use natural spoken language
+- No lists or long explanations
+- Sound like a polite call center agent
+- Respond quickly and concisely
+- If the audio is unclear, politely ask the caller to repeat`;
 
     const model = agentConfig?.modelName || "gpt-4o-mini";
 
@@ -447,7 +264,10 @@ IMPORTANT: Always reply in the SAME language the user is speaking.
       max_tokens: 120,
       temperature: 0.6,
       messages: [
-        { role: "system", content: systemContent },
+        {
+          role: "system",
+          content: basePrompt,
+        },
         ...history,
       ],
     });
@@ -519,8 +339,6 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig) {
   let botSpeaking = false;
   let interrupted = false;
   let processing = false;
-  let dgConnection = null;
-  let rtpSock = null;
 
   function interrupt() {
     if (botSpeaking && currentSender) {
@@ -532,139 +350,98 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig) {
     }
   }
 
-  try {
-    rtpSock = dgram.createSocket("udp4");
-    let actualRemote = { ...remote };
-    let firstPacket = true;
-    let highEnergyCount = 0;
+  const rtpSock = dgram.createSocket("udp4");
+  let actualRemote = { ...remote };
+  let firstPacket = true;
+  let highEnergyCount = 0;
 
-    const INTERRUPT_THRESHOLD = 50;
-    const INTERRUPT_PACKETS = 5;
+  const INTERRUPT_THRESHOLD = 50;
+  const INTERRUPT_PACKETS = 5;
 
-    dgConnection = await createDeepgramWS(async (transcript, detectedLang) => {
-      if (!transcript) return;
+  const dg = await createDeepgramWS(async (transcript, detectedLang) => {
+    if (!transcript) return;
 
-      // Check bot-enabled flag from activeCalls map (can be toggled via API)
-      const callEntry = activeCalls.get(callMeta.callId);
-      const isBotEnabled = () => callEntry?.botEnabled ?? true;
+    const callEntry = activeCalls.get(callMeta.callId);
+    const isBotEnabled = () => callEntry?.botEnabled ?? true;
 
-      if (botSpeaking) interrupt();
-      if (processing) return;
+    if (botSpeaking) interrupt();
+    if (processing) return;
 
-      processing = true;
-      interrupted = false;
+    processing = true;
+    interrupted = false;
 
-      try {
-        await respondToUser(
-          transcript,
-          detectedLang,
-          history,
-          rtpSock,
-          actualRemote,
-          (s) => {
-            currentSender = s;
-            botSpeaking = true;
-            // Expose sender to API for stop-bot
-            if (callEntry) callEntry.currentSender = s;
-          },
-          () => {
-            botSpeaking = false;
-            processing = false;
-            if (callEntry) callEntry.currentSender = null;
-          },
-          () => interrupted,
-          isBotEnabled,
-          agentConfig,
-        );
-      } catch (err) {
-        console.error("❌ Error in respondToUser:", err.message);
-      } finally {
+    await respondToUser(
+      transcript,
+      detectedLang,
+      history,
+      rtpSock,
+      actualRemote,
+      (s) => {
+        currentSender = s;
+        botSpeaking = true;
+        if (callEntry) callEntry.currentSender = s;
+      },
+      () => {
+        botSpeaking = false;
         processing = false;
-      }
-    });
+        if (callEntry) callEntry.currentSender = null;
+      },
+      () => interrupted,
+      isBotEnabled,
+      agentConfig,
+    );
 
-    rtpSock.on("message", (msg, rinfo) => {
-      if (msg.length <= 12) return;
+    processing = false;
+  });
 
-      if (firstPacket) {
-        actualRemote = { ip: rinfo.address, port: rinfo.port };
-        console.log(
-          `🎯 First RTP from ${rinfo.address}:${rinfo.port} (SDP said ${remote.ip}:${remote.port})`,
-        );
-        firstPacket = false;
-      }
+  rtpSock.on("message", (msg, rinfo) => {
+    if (msg.length <= 12) return;
 
-      const payload = msg.slice(12);
+    if (firstPacket) {
+      actualRemote = { ip: rinfo.address, port: rinfo.port };
+      console.log(
+        `🎯 First RTP from ${rinfo.address}:${rinfo.port} (SDP said ${remote.ip}:${remote.port})`,
+      );
+      firstPacket = false;
+    }
 
-      if (botSpeaking) {
-        const energy =
-          payload.reduce((s, b) => s + ((b & 0x7f) ^ 0x7f), 0) / payload.length;
+    const payload = msg.slice(12);
 
-        if (energy > INTERRUPT_THRESHOLD) {
-          highEnergyCount++;
-          if (highEnergyCount >= INTERRUPT_PACKETS) {
-            highEnergyCount = 0;
-            interrupt();
-          }
-        } else {
+    if (botSpeaking) {
+      const energy =
+        payload.reduce((s, b) => s + ((b & 0x7f) ^ 0x7f), 0) / payload.length;
+
+      if (energy > INTERRUPT_THRESHOLD) {
+        highEnergyCount++;
+        if (highEnergyCount >= INTERRUPT_PACKETS) {
           highEnergyCount = 0;
+          interrupt();
         }
       } else {
         highEnergyCount = 0;
       }
-
-      if (dgConnection) {
-        try {
-          dgConnection.send(payload);
-        } catch (err) {
-          console.error("⚠️ Deepgram send error:", err.message);
-        }
-      }
-    });
-
-    rtpSock.on("error", (e) => console.error("❌ RTP error:", e.message));
-
-    await new Promise((resolve, reject) => {
-      rtpSock.bind(localRtpPort, "0.0.0.0", (err) => {
-        if (err) {
-          console.error("❌ Failed to bind RTP socket:", err.message);
-          reject(err);
-        } else {
-          console.log(`🎧 RTP socket bound on 0.0.0.0:${localRtpPort}`);
-          resolve();
-        }
-      });
-    });
-
-    return {
-      stop: () => {
-        if (dgConnection) {
-          try { dgConnection.close(); } catch (_) {}
-        }
-        if (rtpSock) {
-          try { rtpSock.close(); } catch (_) {}
-        }
-        if (currentSender) {
-          try { currentSender.stop(); } catch (_) {}
-        }
-      },
-    };
-  } catch (err) {
-    console.error("❌ handleCall error:", err.message);
-    
-    // Cleanup on error
-    if (dgConnection) {
-      try { dgConnection.close(); } catch (_) {}
+    } else {
+      highEnergyCount = 0;
     }
-    if (rtpSock) {
-      try { rtpSock.close(); } catch (_) {}
-    }
-    if (currentSender) {
-      try { currentSender.stop(); } catch (_) {}
-    }
-    
-    throw err;
-  }
+
+    dg.send(payload);
+  });
+
+  rtpSock.on("error", (e) => console.error("❌ RTP error:", e.message));
+
+  rtpSock.bind(localRtpPort, "0.0.0.0", () => {
+    console.log(`🎧 RTP socket bound on 0.0.0.0:${localRtpPort}`);
+  });
+
+  return {
+    stop: () => {
+      dg.close();
+      try {
+        rtpSock.close();
+      } catch (_) {}
+      if (currentSender) currentSender.stop();
+    },
+  };
 }
 
 // ── SIP ───────────────────────────────────────────────────────────────────────
@@ -710,19 +487,10 @@ srf.invite(async (req, res) => {
 
   console.log(`\n📞 Call: ${fromNum} → ${toNum}  [${callId}]`);
   console.log(`📡 Remote RTP from SDP: ${remote.ip}:${remote.port}`);
-  
-  try {
-    res.send(100);
-  } catch (e) {
-    console.error("❌ Failed to send 100 Trying:", e.message);
-    return;
-  }
-
-  let session = null;
-  let port = null;
+  res.send(100);
 
   try {
-    port = getFreePort();
+    const port = getFreePort();
     const callMeta = {
       callId,
       fromNumber: fromNum,
@@ -730,7 +498,7 @@ srf.invite(async (req, res) => {
       extension: toNum,
     };
 
-    // Look up the extension's assigned AI agent (with error handling)
+    // Load AI agent config
     let agentConfig = null;
     try {
       const extDoc = await SipExtension.findOne({ extension: toNum }).populate("aiAgent");
@@ -740,31 +508,23 @@ srf.invite(async (req, res) => {
           modelName: extDoc.aiAgent.modelName 
         };
         console.log(`🤖 Using agent: ${extDoc.aiAgent.name} (${agentConfig.modelName})`);
-      } else {
-        console.log(`🤖 No active agent for extension ${toNum}, using default`);
       }
     } catch (agentErr) {
-      console.error("⚠️ Failed to load AI agent, using default:", agentErr.message);
-      agentConfig = null;
+      console.error("⚠️ Failed to load AI agent:", agentErr.message);
     }
 
-    session = await handleCall(port, remote, callMeta, agentConfig);
+    const session = await handleCall(port, remote, callMeta, agentConfig);
 
-    // ── Log to DB + in-memory ──────────────────────────────────────────────
-    try {
-      await CallLog.create({
-        callId,
-        extension: toNum,
-        fromNumber: fromNum,
-        toNumber: toNum,
-        remoteIp: remote.ip,
-        remotePort: remote.port,
-        status: "active",
-        botEnabled: true,
-      });
-    } catch (dbErr) {
-      console.error("⚠️ Failed to log call to DB:", dbErr.message);
-    }
+    await CallLog.create({
+      callId,
+      extension: toNum,
+      fromNumber: fromNum,
+      toNumber: toNum,
+      remoteIp: remote.ip,
+      remotePort: remote.port,
+      status: "active",
+      botEnabled: true,
+    });
 
     activeCalls.set(callId, {
       session,
@@ -784,47 +544,33 @@ srf.invite(async (req, res) => {
 
     dialog.on("destroy", async () => {
       console.log("📵 Call ended");
-      if (session) session.stop();
-      if (port) usedPorts.delete(port);
+      session.stop();
+      usedPorts.delete(port);
 
-      // ── Update DB + remove from active map ─────────────────────────────
       const startedAt = activeCalls.get(callId)?.startedAt;
       activeCalls.delete(callId);
 
-      try {
-        await CallLog.findOneAndUpdate(
-          { callId },
-          {
-            status: "ended",
-            endedAt: new Date(),
-            durationSeconds: startedAt
-              ? Math.floor((Date.now() - startedAt.getTime()) / 1000)
-              : null,
-          },
-        );
-      } catch (dbErr) {
-        console.error("⚠️ Failed to update call log:", dbErr.message);
-      }
+      await CallLog.findOneAndUpdate(
+        { callId },
+        {
+          status: "ended",
+          endedAt: new Date(),
+          durationSeconds: startedAt
+            ? Math.floor((Date.now() - startedAt.getTime()) / 1000)
+            : null,
+        },
+      );
     });
   } catch (e) {
-    console.error("❌ Call error:", e.message);
-    console.error("Stack:", e.stack);
+    console.error("❌ Call error:", e.message, e.stack);
 
-    // Cleanup
-    if (session) {
-      try { session.stop(); } catch (_) {}
-    }
-    if (port) usedPorts.delete(port);
+    await CallLog.findOneAndUpdate({ callId }, { status: "failed" }).catch(
+      () => {},
+    );
     activeCalls.delete(callId);
 
-    // Update DB
     try {
-      await CallLog.findOneAndUpdate({ callId }, { status: "failed" });
-    } catch (_) {}
-
-    // Send error response
-    try {
-      res.send(500, "Internal Server Error");
+      res.send(500);
     } catch (_) {}
   }
 });
