@@ -3,6 +3,7 @@
  * Fixed: RTP send back to correct address + debug logging
  * Fixed: Interruption sensitivity (higher threshold + debounce)
  * Updated: exports `srf` for extension.controller + integrates activeCalls
+ * Added: AI Agent integration, RAG files, and token limiting
  */
 
 import Srf from "drachtio-srf";
@@ -13,6 +14,8 @@ import { v4 as uuidv4 } from "uuid";
 import { activeCalls } from "../controllers/call.controller.js";
 import { CallLog } from "../models/calllog.model.js";
 import { SipExtension } from "../models/extension.model.js";
+import { getRelevantContext } from "./rag.service.js";
+import { checkTokenLimit, trackTokenUsage } from "./tokenTracking.service.js";
 
 export const srf = new Srf();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -137,13 +140,16 @@ function createRtpSender(sendSock, host, port) {
 // ── Deepgram WebSocket ────────────────────────────────────────────────────────
 function createDeepgramWS(onUtterance) {
   const params = new URLSearchParams({
-    model: "nova-2",
+    model: "nova-3",
     encoding: "mulaw",
     sample_rate: "8000",
     channels: "1",
+    detect_language: "true",
     interim_results: "true",
     endpointing: "400",
     utterance_end_ms: "1200",
+    smart_format: "true",
+    punctuate: "true",
   });
 
   const ws = new WebSocket(`wss://api.deepgram.com/v1/listen?${params}`, {
@@ -216,6 +222,7 @@ async function respondToUser(
   isInterrupted,
   isBotEnabled,
   agentConfig,
+  extensionId,
 ) {
   if (!isBotEnabled()) {
     console.log("🤖 Bot disabled for this call — skipping response");
@@ -238,6 +245,19 @@ async function respondToUser(
           ? "Arabic"
           : "English";
 
+    // Get RAG context if agent has files
+    let ragContext = "";
+    if (agentConfig?.agentId) {
+      try {
+        ragContext = await getRelevantContext(agentConfig.agentId, transcript, 1500);
+        if (ragContext) {
+          console.log("📚 RAG context loaded:", ragContext.slice(0, 100) + "...");
+        }
+      } catch (ragErr) {
+        console.error("⚠️ RAG error:", ragErr.message);
+      }
+    }
+
     const basePrompt = agentConfig?.systemPrompt?.trim()
       ? agentConfig.systemPrompt
       : `You are a helpful AI voice assistant on a phone call.
@@ -253,7 +273,18 @@ Rules:
 - Respond quickly and concisely
 - If the audio is unclear, politely ask the caller to repeat`;
 
+    const finalPrompt = ragContext 
+      ? `${basePrompt}\n\nContext from knowledge base:\n${ragContext}`
+      : basePrompt;
+
     const model = agentConfig?.modelName || "gpt-4o-mini";
+
+    // Check token limit for ChatGPT
+    const tokenCheck = await checkTokenLimit(extensionId, "chatgpt", finalPrompt, model);
+    if (!tokenCheck.allowed) {
+      console.log(`⚠️ Token limit exceeded: ${tokenCheck.reason}`);
+      return;
+    }
 
     const stream = await openai.chat.completions.create({
       model,
@@ -263,11 +294,14 @@ Rules:
       messages: [
         {
           role: "system",
-          content: basePrompt,
+          content: finalPrompt,
         },
         ...history,
       ],
     });
+
+    // Track token usage
+    await trackTokenUsage(extensionId, "chatgpt", tokenCheck.tokens);
 
     let fullReply = "";
     let pending = "";
@@ -330,7 +364,7 @@ Rules:
 }
 
 // ── Call Handler ──────────────────────────────────────────────────────────────
-async function handleCall(localRtpPort, remote, callMeta, agentConfig) {
+async function handleCall(localRtpPort, remote, callMeta, agentConfig, extensionId) {
   const history = [];
   let currentSender = null;
   let botSpeaking = false;
@@ -386,6 +420,7 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig) {
       () => interrupted,
       isBotEnabled,
       agentConfig,
+      extensionId,
     );
 
     processing = false;
@@ -495,22 +530,29 @@ srf.invite(async (req, res) => {
       extension: toNum,
     };
 
-    // Load AI agent config
+    // Load AI agent config with RAG files
     let agentConfig = null;
+    let extensionId = null;
     try {
       const extDoc = await SipExtension.findOne({ extension: toNum }).populate("aiAgent");
+      extensionId = extDoc?._id;
+      
       if (extDoc?.aiAgent?.isActive) {
         agentConfig = { 
+          agentId: extDoc.aiAgent._id,
           systemPrompt: extDoc.aiAgent.systemPrompt, 
           modelName: extDoc.aiAgent.modelName 
         };
         console.log(`🤖 Using agent: ${extDoc.aiAgent.name} (${agentConfig.modelName})`);
+        if (extDoc.aiAgent.ragFiles?.length > 0) {
+          console.log(`📚 Agent has ${extDoc.aiAgent.ragFiles.length} RAG files`);
+        }
       }
     } catch (agentErr) {
       console.error("⚠️ Failed to load AI agent:", agentErr.message);
     }
 
-    const session = await handleCall(port, remote, callMeta, agentConfig);
+    const session = await handleCall(port, remote, callMeta, agentConfig, extensionId);
 
     await CallLog.create({
       callId,
